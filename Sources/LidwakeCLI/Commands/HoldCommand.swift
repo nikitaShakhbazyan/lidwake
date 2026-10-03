@@ -1,0 +1,96 @@
+import LidwakeKit
+import Foundation
+@preconcurrency import OSLog
+
+/// `lidwake hold` — places an explicit, reasoned, time-boxed sleep block that outlives the
+/// agent's turn/session and the agent process itself. Prints the minted hold id on stdout so a
+/// script can capture it (`HOLD=$(lidwake hold --reason "deploy" --for 30m)`); a human summary
+/// goes to stderr. Release it with `lidwake release <id>`, or let it expire.
+enum HoldCommand {
+    static func run(args: [String]) throws {
+        let parser = ArgParser(args: args)
+        let reason = parser.option("--reason")
+        let tool = parser.option("--tool")
+
+        // --for accepts a human duration ("30m", "2h", "1h30m"); --ttl stays raw seconds for parity
+        // with `acquire`. The daemon clamps to the configured cap regardless.
+        var ttl: TimeInterval?
+        if let forStr = parser.option("--for") {
+            guard let secs = DurationParser.seconds(from: forStr) else {
+                FileHandle.standardError.write(Data("hold: could not understand duration '\(forStr)' (try 30m, 2h, 1h30m)\n".utf8))
+                exit(2)
+            }
+            ttl = secs
+        } else if let ttlStr = parser.option("--ttl") {
+            ttl = Double(ttlStr)
+        }
+
+        var pid: pid_t?
+        if let pidStr = parser.option("--pid") {
+            guard let p = Int32(pidStr), p > 0 else {
+                FileHandle.standardError.write(Data("hold: --pid must be a positive process id\n".utf8))
+                exit(2)
+            }
+            pid = p
+        }
+
+        Logger(subsystem: LidwakeConstants.appBundleID, category: "CLI")
+            .notice("hold reason='\(reason ?? "", privacy: .public)' ttl=\(ttl.map { String(Int($0)) } ?? "default", privacy: .public) pid=\(pid ?? -1, privacy: .public)")
+
+        let wantsDisplay = parser.flag("--display")
+        let req = CLIRequest(
+            op: .hold,
+            key: nil,
+            tool: tool,
+            reason: reason,
+            pid: pid,
+            processName: tool,
+            ttlSeconds: ttl,
+            display: wantsDisplay ? true : nil,
+        )
+
+        do {
+            let resp = try DaemonSocketClient.send(req)
+            guard resp.ok, let key = resp.holdKey else {
+                FileHandle.standardError.write(Data("hold failed: \(resp.error ?? "unknown error")\n".utf8))
+                exit(1)
+            }
+            // Version-skew check: an old daemon ignores the unknown `display` field and omits the
+            // echo. A hold whose whole point may be the display must say so out loud — the caller
+            // still gets the system hold, hence warn-and-continue rather than fail.
+            if wantsDisplay, resp.displayApplied == nil {
+                FileHandle.standardError.write(Data("hold: the running daemon predates --display — the system stays awake but the display is NOT held. Update lidwake.\n".utf8))
+            }
+            // Machine-readable id on stdout; human summary on stderr. The daemon clamps the TTL
+            // to the configured cap, so the summary reports what was actually applied.
+            print(key)
+            FileHandle.standardError.write(Data(summary(key: key, ttl: resp.appliedTTLSeconds ?? ttl, pid: pid).utf8))
+            exit(0)
+        } catch {
+            // A hold must report failure — unlike a hook acquire, the agent needs to know it did
+            // not take so it doesn't assume the Mac will stay awake.
+            FileHandle.standardError.write(Data("hold failed: \(error.localizedDescription)\n".utf8))
+            exit(1)
+        }
+    }
+
+    private static func summary(key: String, ttl: TimeInterval?, pid: pid_t?) -> String {
+        var parts = ["Keeping your Mac awake"]
+        if let pid { parts.append("until process \(pid) exits") }
+        if let ttl {
+            parts.append("for up to \(humanDuration(ttl))")
+        } else {
+            parts.append("for up to 1h")
+        }
+        parts.append("· release with: lidwake release \(key)")
+        return parts.joined(separator: " ") + "\n"
+    }
+
+    private static func humanDuration(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds.rounded())
+        let h = total / 3_600, m = (total % 3_600) / 60, s = total % 60
+        if h > 0 { return m > 0 ? "\(h)h\(m)m" : "\(h)h" }
+        if m > 0 { return s > 0 ? "\(m)m\(s)s" : "\(m)m" }
+        return "\(s)s"
+    }
+}

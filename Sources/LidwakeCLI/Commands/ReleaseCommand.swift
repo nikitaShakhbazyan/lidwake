@@ -1,0 +1,108 @@
+import LidwakeKit
+import Foundation
+@preconcurrency import OSLog
+
+enum ReleaseCommand {
+    static func run(args: [String]) throws {
+        let parser = ArgParser(args: args)
+        let namedTool = parser.option("--tool")
+        let tool = namedTool ?? ManualHold.unknownTool
+
+        // `release --all` is a *human* command (the SSH counterpart of the menu bar's force
+        // release), not an agent hook — so unlike the paths below it reports its outcome and
+        // exits nonzero on transport failure instead of failing soft.
+        if parser.flag("--all") {
+            releaseAll()
+        }
+
+        let fullKey: String
+        if parser.flag("--subagent") {
+            // Sub-agent lifecycle hook (`SubagentStop`). Release the sub-agent's own
+            // `<tool>:<agent_id>` hold — keyed on stdin `agent_id`, the same id its `SubagentStart`
+            // acquired — never the parent's `session_id`. No fallback: a missing `agent_id` fails soft
+            // (the daemon's idle/dead-process nets recover the hold) rather than releasing the wrong key.
+            guard let agentID = CLIStdin.agentID() else {
+                AcquireCommand.hookFailure("release --subagent: no agent_id on stdin — ignored")
+            }
+            fullKey = ManualHold.sessionKey(tool: tool, sessionID: agentID)
+        } else if let kind = AgentKind(rawValue: tool), kind.isGatewayScoped {
+            // Gateway-scoped agent: the hold is coalesced onto the fixed `<tool>:gateway` key
+            // (see AcquireCommand), so release targets it directly regardless of session id. This is
+            // the fast path back to sleep; the daemon's CPU-idle net is what covers a missed end hook.
+            fullKey = "\(tool):gateway"
+        } else {
+            // Prefer the hook's stdin `session_id` over the positional env-var expansion (see acquire).
+            let positional = parser.positional(0)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let key = CLIStdin.sessionID() ?? (positional?.isEmpty == false ? positional : nil) else {
+                AcquireCommand.hookFailure("release: no session key (stdin payload or positional) — ignored")
+            }
+            // An agent-hold id (`hold:…`), an already-prefixed `<tool>:<session>` key, or a
+            // daemon-minted `sniffed:` key is already the full registry key — release it verbatim,
+            // so `release` accepts every key form `status --json` prints. Bare ids get the same
+            // `<tool>:` derivation acquire uses, so a session's Stop release targets exactly the
+            // key its UserPromptSubmit acquire placed.
+            fullKey = key.hasPrefix(CLIRequestValidator.sniffedKeyPrefix)
+                ? key
+                : ManualHold.sessionKey(tool: tool, sessionID: key)
+        }
+        Logger(subsystem: LidwakeConstants.appBundleID, category: "CLI")
+            .notice("release \(fullKey, privacy: .public)")
+
+        let req = CLIRequest(
+            op: .release,
+            key: fullKey,
+            tool: tool,
+            reason: nil,
+            pid: nil,
+            processName: nil,
+            ttlSeconds: nil,
+        )
+
+        do {
+            let resp = try DaemonSocketClient.send(req)
+            if let warning = resp.warning {
+                FileHandle.standardError.write(Data("lidwake: \(warning)\n".utf8))
+                // A release that matched nothing must be visible to scripts — a cleanup loop
+                // "releasing" with exit 0 and zero effect is the worst case. Scripts
+                // run without a TTY, so TTY discrimination alone can't reach them; an omitted
+                // `--tool` is the reliable marker instead — every generated hook names its tool,
+                // so the bare form is a human or script working from `status --json` keys. Hooks
+                // (named tool, no TTY) stay fail-soft: their safety-net double releases are
+                // routine no-ops, and a nonzero exit would surface as an agent-side hook error.
+                exit(namedTool == nil || isatty(FileHandle.standardInput.fileDescriptor) != 0 ? 1 : 0)
+            }
+            exit(0)
+        } catch {
+            // Never fail the agent's hook, whatever the transport failure. A missed release is
+            // recovered by the daemon's idle sweep and process-exit watcher.
+            FileHandle.standardError.write(Data("lidwake: release failed (\(error.localizedDescription)) — ignored\n".utf8))
+            exit(0)
+        }
+    }
+
+    private static func releaseAll() -> Never {
+        Logger(subsystem: LidwakeConstants.appBundleID, category: "CLI").notice("release --all")
+        let req = CLIRequest(
+            op: .releaseAll,
+            key: nil,
+            tool: nil,
+            reason: nil,
+            pid: nil,
+            processName: nil,
+            ttlSeconds: nil,
+        )
+        do {
+            let resp = try DaemonSocketClient.send(req)
+            let released = resp.releasedCount ?? 0
+            if released > 0 {
+                print("Released \(released) assertion\(released == 1 ? "" : "s") — your Mac can sleep.")
+            } else {
+                print("Nothing was held — released nothing.")
+            }
+            exit(0)
+        } catch {
+            FileHandle.standardError.write(Data("lidwake: release --all failed (\(error.localizedDescription))\n".utf8))
+            exit(1)
+        }
+    }
+}

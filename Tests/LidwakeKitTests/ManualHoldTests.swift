@@ -1,0 +1,159 @@
+import Foundation
+import Testing
+@testable import LidwakeKit
+
+@Suite("ManualHold")
+struct ManualHoldTests {
+    @Test
+    func `clampTTL defaults to one hour when no duration is given`() {
+        #expect(ManualHold.clampTTL(nil, capHours: 4) == 3_600)
+    }
+
+    @Test
+    func `clampTTL caps an over-long request`() {
+        #expect(ManualHold.clampTTL(10 * 3_600, capHours: 4) == 4 * 3_600)
+    }
+
+    @Test
+    func `clampTTL passes a within-cap request through`() {
+        #expect(ManualHold.clampTTL(1_800, capHours: 4) == 1_800)
+    }
+
+    @Test
+    func `clampTTL floors at one second`() {
+        #expect(ManualHold.clampTTL(0, capHours: 4) == 1)
+        #expect(ManualHold.clampTTL(-50, capHours: 4) == 1)
+    }
+
+    @Test
+    func `newKey is namespaced and recognized`() {
+        let key = ManualHold.newKey()
+        #expect(key.hasPrefix("hold:"))
+        #expect(ManualHold.isHoldKey(key))
+        #expect(!ManualHold.isHoldKey("claude-code:abc123"))
+    }
+
+    @Test
+    func `newKey is unique across calls`() {
+        #expect(ManualHold.newKey() != ManualHold.newKey())
+    }
+
+    // MARK: - sessionKey (acquire/release key derivation)
+
+    @Test
+    func `sessionKey prefixes a bare session id`() {
+        #expect(ManualHold.sessionKey(tool: "opencode", sessionID: "ses_xyz") == "opencode:ses_xyz")
+    }
+
+    @Test
+    func `sessionKey passes a hold id through verbatim`() {
+        #expect(ManualHold.sessionKey(tool: "manual", sessionID: "hold:ab12cd34") == "hold:ab12cd34")
+    }
+
+    /// `status --json` prints the full `<tool>:<session>` key; `release` fed that form back must
+    /// target the same assertion, not a double-prefixed `<tool>:<tool>:<session>` that matches
+    /// nothing (the silent no-op of ).
+    @Test
+    func `sessionKey passes an already-prefixed key through verbatim`() {
+        #expect(ManualHold.sessionKey(tool: "opencode", sessionID: "opencode:ses_xyz") == "opencode:ses_xyz")
+        #expect(ManualHold.sessionKey(tool: "claude-code", sessionID: "claude-code:f9b4e284") == "claude-code:f9b4e284")
+    }
+
+    @Test
+    func `sessionKey still prefixes a foreign tool prefix`() {
+        // Only THIS tool's prefix is a passthrough — a session id that merely contains a colon
+        // (or another tool's key under a mismatched --tool) still gets the standard derivation,
+        // keeping acquire/release symmetric for exotic ids.
+        #expect(ManualHold.sessionKey(tool: "cursor", sessionID: "opencode:ses_xyz") == "cursor:opencode:ses_xyz")
+    }
+
+    /// The rest of with no `--tool` at all, the CLI's default tool used to prefix the
+    /// pasted key into `unknown:<tool>:<session>` — so the exact form `status --json` emits could
+    /// never match. A colon-bearing id under the unknown tool is a pasted full key, not a session id.
+    @Test
+    func `sessionKey passes a prefixed key through when no tool is named`() {
+        #expect(ManualHold.sessionKey(tool: ManualHold.unknownTool, sessionID: "opencode:repro-25") == "opencode:repro-25")
+        #expect(ManualHold.sessionKey(tool: ManualHold.unknownTool, sessionID: "pi:/Users/u/.pi/agent/sessions/s.jsonl") == "pi:/Users/u/.pi/agent/sessions/s.jsonl")
+    }
+
+    @Test
+    func `sessionKey still prefixes a bare id when no tool is named`() {
+        #expect(ManualHold.sessionKey(tool: ManualHold.unknownTool, sessionID: "repro-25") == "unknown:repro-25")
+    }
+
+    @Test
+    func `sessionKey derivation is idempotent`() {
+        let once = ManualHold.sessionKey(tool: "opencode", sessionID: "ses_xyz")
+        #expect(ManualHold.sessionKey(tool: "opencode", sessionID: once) == once)
+    }
+
+    // MARK: - clampExpiry (daemon-side TTL ceiling for hook acquires)
+
+    @Test
+    func `clampExpiry leaves a TTL-less assertion untouched`() {
+        // Per-turn and sub-agent hooks carry no TTL; they stay governed by the idle policy, not a
+        // deadline.
+        #expect(ManualHold.clampExpiry(nil, acquiredAt: Date(), capHours: 4) == nil)
+    }
+
+    @Test
+    func `clampExpiry caps an over-long expiry to the max-hold`() {
+        // The background-shell hook requests the 24h ceiling; the daemon must bring it down to the
+        // user's live cap so a background task can't pin the Mac past it.
+        let acquired = Date(timeIntervalSince1970: 1_000_000)
+        let requested = acquired.addingTimeInterval(24 * 3_600)
+        let clamped = ManualHold.clampExpiry(requested, acquiredAt: acquired, capHours: 4)
+        #expect(clamped == acquired.addingTimeInterval(4 * 3_600))
+    }
+
+    @Test
+    func `clampExpiry passes a within-cap expiry through`() {
+        let acquired = Date(timeIntervalSince1970: 1_000_000)
+        let requested = acquired.addingTimeInterval(30 * 60)
+        #expect(ManualHold.clampExpiry(requested, acquiredAt: acquired, capHours: 4) == requested)
+    }
+
+    @Test
+    func `clampExpiry keeps a positive floor for a zero-hour cap`() {
+        // A degenerate cap must still yield a future expiry (max(1, …)), never acquiredAt or earlier.
+        let acquired = Date(timeIntervalSince1970: 1_000_000)
+        let requested = acquired.addingTimeInterval(10 * 3_600)
+        let clamped = ManualHold.clampExpiry(requested, acquiredAt: acquired, capHours: 0)
+        #expect(clamped == acquired.addingTimeInterval(1))
+    }
+}
+
+@Suite("DurationParser")
+struct DurationParserTests {
+    @Test
+    func `bare number is seconds`() {
+        #expect(DurationParser.seconds(from: "90") == 90)
+    }
+
+    @Test
+    func `single units`() {
+        #expect(DurationParser.seconds(from: "30s") == 30)
+        #expect(DurationParser.seconds(from: "45m") == 2_700)
+        #expect(DurationParser.seconds(from: "2h") == 7_200)
+        #expect(DurationParser.seconds(from: "1d") == 86_400)
+    }
+
+    @Test
+    func `compound durations sum`() {
+        #expect(DurationParser.seconds(from: "1h30m") == 5_400)
+        #expect(DurationParser.seconds(from: "2h15m30s") == 8_130)
+    }
+
+    @Test
+    func `case-insensitive and whitespace-tolerant`() {
+        #expect(DurationParser.seconds(from: " 2H ") == 7_200)
+    }
+
+    @Test
+    func `garbage and ambiguous trailing digits are rejected`() {
+        #expect(DurationParser.seconds(from: "") == nil)
+        #expect(DurationParser.seconds(from: "soon") == nil)
+        #expect(DurationParser.seconds(from: "1h30") == nil)
+        #expect(DurationParser.seconds(from: "5x") == nil)
+    }
+}

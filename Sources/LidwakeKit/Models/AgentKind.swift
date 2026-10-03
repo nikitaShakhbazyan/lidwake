@@ -1,0 +1,173 @@
+import Foundation
+
+/// All agentic tools Lidwake knows about.
+public enum AgentKind: String, Codable, CaseIterable, Sendable {
+    case claudeCode = "claude-code"
+    case codex
+    case cursor
+    case geminiCLI = "gemini-cli"
+    case aider
+    case hermes
+    case openCode = "opencode"
+    case cline
+    case pi
+
+    public var displayName: String {
+        switch self {
+        case .claudeCode: "Claude Code"
+        case .codex: "Codex"
+        case .cursor: "Cursor"
+        case .geminiCLI: "Gemini CLI"
+        case .aider: "Aider"
+        case .hermes: "Hermes"
+        case .openCode: "OpenCode"
+        case .cline: "Cline"
+        case .pi: "Pi"
+        }
+    }
+
+    /// Binary name(s) used by process sniffer.
+    public var binaryNames: [String] {
+        switch self {
+        case .claudeCode: ["claude"]
+        // Homebrew's cask symlinks `codex` → the triple-suffixed real binary
+        // (`codex-aarch64-apple-darwin`), and `proc_pidpath` resolves the symlink, so the process
+        // basename the daemon sees is the suffixed name, not `codex`. Without these the owning-PID
+        // walk and sniff sweep miss every Homebrew install — the assertion is placed with no PID, so
+        // neither the process-exit watcher nor the CPU-idle sweep can release it, leaving the hold
+        // pinned until the 24h backstop. (npm spawns a native binary actually named `codex`.)
+        case .codex: ["codex", "codex-aarch64-apple-darwin", "codex-x86_64-apple-darwin"]
+        case .cursor: ["cursor", "Cursor"]
+        case .geminiCLI: ["gemini"]
+        case .aider: ["aider"]
+        case .hermes: ["hermes"]
+        // npm's `opencode-ai` package maps its bin entry to `bin/opencode.exe` (yes, on macOS), and
+        // Homebrew symlinks `opencode` → that file, so `proc_pidpath` sees basename `opencode.exe`.
+        // Without it the owning-PID walk binds the plugin's hold to whatever agent ancestor spawned
+        // opencode, and the sniff sweep never sees the process at all. (Direct npm installs spawn a
+        // wrapper actually named `opencode`.)
+        case .openCode: ["opencode", "opencode.exe"]
+        case .cline: ["cline"]
+        // `pi` runs as a Node process (argv0 often "node"), so the sniffer rarely matches it —
+        // the TS extension hook is the real integration; this is a weak best-effort fallback.
+        case .pi: ["pi"]
+        }
+    }
+
+    /// Every known binary name across all agents. Cached: the mapping is static.
+    public static let allBinaryNames: Set<String> = Set(allCases.flatMap(\.binaryNames))
+
+    /// Binary names that may also match a *directory component* of an executable path, not just
+    /// its basename. Reserved for versioned install layouts where the basename is a version
+    /// string (`…/claude/versions/2.1.156`). Generic names must never component-match — `pi`
+    /// would claim anything under a Raspberry Pi project folder, and any executable inside a
+    /// user's `~/src/cline/` would read as that agent.
+    public static let componentMatchedBinaryNames: Set<String> = ["claude"]
+
+    /// Reverse lookup from a binary name to its agent. Cached: the mapping is static.
+    public static let byBinaryName: [String: AgentKind] = {
+        var map: [String: AgentKind] = [:]
+        for kind in allCases {
+            for name in kind.binaryNames {
+                map[name] = kind
+            }
+        }
+        return map
+    }()
+
+    /// Identify the agent owning a running process: by basename first, then — only for the
+    /// agents in `componentMatchedBinaryNames` — by path component, so versioned installs
+    /// (e.g. `…/claude/versions/2.1.156`, basename `2.1.156`) are still recognized by their
+    /// `claude` path segment. Returns nil if unknown.
+    public static func forRunningProcess(name: String, path: String) -> AgentKind? {
+        if let kind = byBinaryName[name] { return kind }
+        for component in (path as NSString).pathComponents where componentMatchedBinaryNames.contains(component) {
+            if let kind = byBinaryName[component] { return kind }
+        }
+        return nil
+    }
+
+    /// argv substring markers for agents that run under a generic interpreter, where the executable
+    /// path (`python`, `node`) reveals nothing. A process matches this agent when its argv contains
+    /// *every* marker in *any one* of these groups (groups are alternatives). Hermes runs as
+    /// `python -m hermes_cli.main {gateway run | dashboard …}`, so both the long-lived gateway and the
+    /// desktop app's embedded dashboard are recognized. `nil` for agents identifiable by path.
+    public var argvMarkers: [[String]]? {
+        switch self {
+        case .hermes: [["hermes_cli.main", "gateway"], ["hermes_cli.main", "dashboard"]]
+        default: nil
+        }
+    }
+
+    /// Agents that can only be identified by inspecting argv (see `argvMarkers`). Cached: static.
+    public static let argvMatchedAgents: [AgentKind] = allCases.filter { $0.argvMarkers != nil }
+
+    /// Identify the agent that an argument vector belongs to, for interpreter-hosted agents the
+    /// path-based `forRunningProcess(name:path:)` can't recognize. A marker matches if it is a
+    /// substring of *any* argv element; an agent matches if all markers in one of its groups do.
+    public static func forRunningProcess(argv: [String]) -> AgentKind? {
+        guard !argv.isEmpty else { return nil }
+        for kind in argvMatchedAgents {
+            guard let groups = kind.argvMarkers else { continue }
+            for group in groups where group.allSatisfy({ marker in argv.contains { $0.contains(marker) } }) {
+                return kind
+            }
+        }
+        return nil
+    }
+
+    /// Environment markers Pi's CLI and RPC entry points set in their own process at startup
+    /// (`AI_AGENT=pi`, `PI_CODING_AGENT=true`), inherited by every child Pi spawns — including the
+    /// CLI its extension shells out to. Their presence proves Pi is an ancestor of this process,
+    /// which is what authorizes the argv-based owner walk (`argvIsPi`): without the gate, that walk
+    /// could bind a hold to an arbitrary Node ancestor of a non-Pi invocation.
+    public static func environmentMarksPi(_ environment: [String: String]) -> Bool {
+        environment["PI_CODING_AGENT"] == "true" || environment["AI_AGENT"] == "pi"
+    }
+
+    /// Whether an argument vector identifies a Node-hosted Pi process. Pi's `bin` entry is a
+    /// `#!/usr/bin/env node` script, so the running process is `node <script> …` — its executable
+    /// path is Node's, and only argv reveals the agent (the path-based walk returned -1,
+    /// leaving the hold with no PID for the dead-process and CPU-idle nets). `<script>` is the
+    /// launcher path the user invoked: an npm/Homebrew symlink with basename `pi`, or (for Nix-style
+    /// wrappers that exec the real entry point) a path inside the `pi-coding-agent` package.
+    /// `argv[0]` — the interpreter — is skipped; a standalone binary actually named `pi` is matched
+    /// by the executable-path walk instead. Callers must gate on `environmentMarksPi`: these
+    /// patterns alone are too weak to identify Pi among arbitrary processes.
+    public static func argvIsPi(_ argv: [String]) -> Bool {
+        argv.dropFirst().contains { arg in
+            (arg as NSString).lastPathComponent == "pi" || arg.contains("pi-coding-agent")
+        }
+    }
+
+    /// For an agent that runs as a single long-lived **shared process** (a gateway/daemon)
+    /// multiplexing many logical sessions — rather than one process per session — this is the path,
+    /// relative to the user's home, of the pid-file that process writes. `nil` for the normal
+    /// one-process-per-session agents.
+    ///
+    /// Such agents need different hold bookkeeping: (1) their per-session start/end hooks don't
+    /// bracket process lifetime, so a hold is keyed to a single fixed gateway scope rather than per
+    /// session, and (2) the executable is a generic interpreter (Hermes runs as
+    /// `python -m hermes_cli.main gateway run`), so `ProcessResolver.owningAgentPID`'s parent-walk
+    /// can't identify it — the watched PID is read from this file instead. With a real PID attached,
+    /// the daemon's CPU-idle and dead-process release nets apply to the gateway tree.
+    public var gatewayPIDFileRelativePath: String? {
+        switch self {
+        case .hermes: ".hermes/gateway.pid"
+        default: nil
+        }
+    }
+
+    /// Whether this agent runs as a shared gateway/daemon process (see `gatewayPIDFileRelativePath`).
+    public var isGatewayScoped: Bool {
+        gatewayPIDFileRelativePath != nil
+    }
+
+    /// Integration tier: 1 = full hooks, 2 = partial/wrapper/plugin needed.
+    public var tier: Int {
+        switch self {
+        case .claudeCode, .codex, .cursor, .geminiCLI: 1
+        case .aider, .hermes, .openCode, .cline, .pi: 2
+        }
+    }
+}

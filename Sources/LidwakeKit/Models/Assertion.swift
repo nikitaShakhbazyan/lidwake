@@ -1,0 +1,310 @@
+import Foundation
+
+/// How an assertion came to exist. Governs lifecycle policy: `.manual` holds are explicit,
+/// user-/agent-initiated, time-boxed blocks that are exempt from the CPU-idle release rule
+/// (an intentional hold for a background job has no user activity to measure), whereas `.hook`
+/// and `.sniffed` assertions track a live agent and are subject to the full idle policy.
+public enum AssertionOrigin: String, Codable, Sendable {
+    /// Acquired by an agent's editor hook (the default, and what old state files decode as).
+    case hook
+    /// An explicit `lidwake hold` — reasoned, TTL-bounded, idle-exempt.
+    case manual
+    /// Auto-acquired by the daemon's process-sniffing sweep.
+    case sniffed
+}
+
+public struct Assertion: Codable, Sendable, Hashable, Identifiable {
+    public let key: String
+    public let tool: String
+    public let reason: String?
+    public let pid: pid_t
+    public let processName: String
+    public let acquiredAt: Date
+    public var lastActivityAt: Date
+    public var expiresAt: Date?
+    public let origin: AssertionOrigin
+    /// Display class (opt-in): this assertion also keeps the *display* awake, not just the system.
+    /// For agents that read the screen — when the display sleeps, every app's accessibility tree
+    /// collapses to the bare application element, so a system-only hold keeps the machine on while
+    /// blinding the agent. Sticky for the key's lifetime: a re-acquire without the flag never
+    /// downgrades a display hold mid-work (dropping it would blind the agent the same way).
+    public var holdsDisplay: Bool
+
+    /// What the owning agent is waiting on when it has stopped mid-turn for the user ("approve
+    /// Bash", "input needed"), else nil. Stamped and cleared by the daemon's session-status sweep;
+    /// the popover row shows it so a hold that isn't working reads as *waiting*, not stuck.
+    public var waitingFor: String?
+
+    public var id: String {
+        key
+    }
+
+    public var age: TimeInterval {
+        Date().timeIntervalSince(acquiredAt)
+    }
+
+    /// Seconds until `expiresAt`, or nil if the assertion has no TTL. Negative once expired.
+    public var timeRemaining: TimeInterval? {
+        expiresAt.map { $0.timeIntervalSince(Date()) }
+    }
+
+    public init(
+        key: String,
+        tool: String,
+        reason: String? = nil,
+        pid: pid_t,
+        processName: String,
+        acquiredAt: Date = Date(),
+        ttl: TimeInterval? = nil,
+        origin: AssertionOrigin = .hook,
+        holdsDisplay: Bool = false,
+    ) {
+        self.key = key
+        self.tool = tool
+        self.reason = reason
+        self.pid = pid
+        self.processName = processName
+        self.acquiredAt = acquiredAt
+        self.lastActivityAt = acquiredAt
+        self.expiresAt = ttl.map { acquiredAt.addingTimeInterval($0) }
+        self.origin = origin
+        self.holdsDisplay = holdsDisplay
+        self.waitingFor = nil
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case tool
+        case reason
+        case pid
+        case processName
+        case acquiredAt
+        case lastActivityAt
+        case expiresAt
+        case origin
+        case holdsDisplay
+        case waitingFor
+    }
+
+    /// Custom decode so state files written before `origin` existed still restore (defaulting to
+    /// `.hook`). Encoding stays synthesized.
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.key = try c.decode(String.self, forKey: .key)
+        self.tool = try c.decode(String.self, forKey: .tool)
+        self.reason = try c.decodeIfPresent(String.self, forKey: .reason)
+        self.pid = try c.decode(pid_t.self, forKey: .pid)
+        self.processName = try c.decode(String.self, forKey: .processName)
+        self.acquiredAt = try c.decode(Date.self, forKey: .acquiredAt)
+        self.lastActivityAt = try c.decode(Date.self, forKey: .lastActivityAt)
+        self.expiresAt = try c.decodeIfPresent(Date.self, forKey: .expiresAt)
+        self.origin = try c.decodeIfPresent(AssertionOrigin.self, forKey: .origin) ?? .hook
+        self.holdsDisplay = try c.decodeIfPresent(Bool.self, forKey: .holdsDisplay) ?? false
+        self.waitingFor = try c.decodeIfPresent(String.self, forKey: .waitingFor)
+    }
+}
+
+public struct DaemonStatus: Codable, Sendable {
+    public var isBlocking: Bool
+    public var assertions: [Assertion]
+
+    /// Whether any active assertion carries the display class — derived, so it can never disagree
+    /// with the assertion list it summarizes (and costs nothing on the wire).
+    public var isHoldingDisplay: Bool {
+        assertions.contains(where: \.holdsDisplay)
+    }
+
+    public var lidClosed: Bool
+    public var helperConnected: Bool
+    public var cpuTemperatureCelsius: Double?
+    public var lastEvent: DaemonEvent?
+    /// When `lastEvent` was recorded. Lets the UI scope transient states (e.g. the
+    /// 30-second thermal-cutout menu-bar icon) without its own bookkeeping.
+    public var lastEventAt: Date?
+    /// `true` when the user has paused Lidwake: all holds are released and agent acquires are
+    /// ignored until resumed. The Mac sleeps normally meanwhile.
+    public var paused: Bool
+
+    /// `true` when the daemon has a "while you were away" summary waiting to be consumed (set on
+    /// lid-open after a kept-awake period). The app fetches the summary via `consumeAwaySummary`
+    /// only when this is set, rather than polling for it on every refresh.
+    public var awaySummaryPending: Bool
+
+    /// Degraded-protection notices for the UI: a clamshell block that couldn't be fully applied,
+    /// an unreadable temperature while the thermal cutout is enabled, an active cutout latch.
+    /// The user trusts a closed lid to a working safety net — when part of it is down, say so.
+    public var warnings: [String]
+
+    /// The assertion registry's monotonic change version at the moment `assertions` was snapshotted.
+    /// The XPC push stream and in-flight poll replies race on the way to the app; comparing
+    /// generations (within one `daemonBootID`) lets the receiver drop the stale payload instead of
+    /// letting the last writer win — which could show "No agents active" while a hold is live.
+    public var generation: UInt64
+
+    /// Identity of the daemon run that minted this status. Generations restart at zero when the
+    /// daemon restarts, so they are only comparable between statuses carrying the same boot id;
+    /// across a restart the receiver must accept the payload unconditionally.
+    public var daemonBootID: UUID?
+
+    /// Machine conditions for `lidwake stats`; nil from a daemon that predates it.
+    public var environment: DaemonEnvironment?
+
+    public init(
+        isBlocking: Bool,
+        assertions: [Assertion],
+        lidClosed: Bool,
+        helperConnected: Bool,
+        cpuTemperatureCelsius: Double?,
+        lastEvent: DaemonEvent?,
+        lastEventAt: Date? = nil,
+        paused: Bool = false,
+        awaySummaryPending: Bool = false,
+        warnings: [String] = [],
+        generation: UInt64 = 0,
+        daemonBootID: UUID? = nil,
+        environment: DaemonEnvironment? = nil,
+    ) {
+        self.isBlocking = isBlocking
+        self.assertions = assertions
+        self.lidClosed = lidClosed
+        self.helperConnected = helperConnected
+        self.cpuTemperatureCelsius = cpuTemperatureCelsius
+        self.lastEvent = lastEvent
+        self.lastEventAt = lastEventAt
+        self.paused = paused
+        self.awaySummaryPending = awaySummaryPending
+        self.warnings = warnings
+        self.generation = generation
+        self.daemonBootID = daemonBootID
+        self.environment = environment
+    }
+
+    /// Tolerant decode: a status from a build without `warnings` still decodes.
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.isBlocking = try c.decode(Bool.self, forKey: .isBlocking)
+        self.assertions = try c.decode([Assertion].self, forKey: .assertions)
+        self.lidClosed = try c.decode(Bool.self, forKey: .lidClosed)
+        self.helperConnected = try c.decode(Bool.self, forKey: .helperConnected)
+        self.cpuTemperatureCelsius = try c.decodeIfPresent(Double.self, forKey: .cpuTemperatureCelsius)
+        self.lastEvent = try c.decodeIfPresent(DaemonEvent.self, forKey: .lastEvent)
+        self.lastEventAt = try c.decodeIfPresent(Date.self, forKey: .lastEventAt)
+        self.paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false
+        self.awaySummaryPending = try c.decodeIfPresent(Bool.self, forKey: .awaySummaryPending) ?? false
+        self.warnings = try c.decodeIfPresent([String].self, forKey: .warnings) ?? []
+        self.generation = try c.decodeIfPresent(UInt64.self, forKey: .generation) ?? 0
+        self.daemonBootID = try c.decodeIfPresent(UUID.self, forKey: .daemonBootID)
+        self.environment = try? c.decodeIfPresent(DaemonEnvironment.self, forKey: .environment)
+    }
+}
+
+/// What the dashboard shows around the agent list.
+public struct DaemonEnvironment: Codable, Sendable, Equatable {
+    /// The kernel's `SleepDisabled` flag — whether a closed lid is actually ignored right now.
+    public var sleepDisabled: Bool
+    public var batteryPercent: Int?
+    public var onBattery: Bool?
+    /// `ProcessInfo.ThermalState` raw value: 0 nominal, 1 fair, 2 serious, 3 critical.
+    public var thermalState: Int
+    /// Latched safety cutouts (`CutoutLatch.Cause` raw values).
+    public var activeCutouts: [String]
+    /// When the off timer will pause lidwake, if one is set.
+    public var offAt: Date?
+    public var settings: LidwakeSettings
+
+    public init(
+        sleepDisabled: Bool,
+        batteryPercent: Int?,
+        onBattery: Bool?,
+        thermalState: Int,
+        activeCutouts: [String],
+        offAt: Date?,
+        settings: LidwakeSettings,
+    ) {
+        self.sleepDisabled = sleepDisabled
+        self.batteryPercent = batteryPercent
+        self.onBattery = onBattery
+        self.thermalState = thermalState
+        self.activeCutouts = activeCutouts
+        self.offAt = offAt
+        self.settings = settings
+    }
+}
+
+/// One agent's line in the "while you were away" summary.
+public struct FinishedAgentSummary: Codable, Sendable, Identifiable, Hashable {
+    /// The assertion key — unique per session, unlike `tool` (two sessions of the same tool
+    /// would otherwise collide as `Identifiable` rows).
+    public let key: String
+    public let tool: String
+    public let displayName: String
+    public let duration: TimeInterval
+
+    public var id: String {
+        key
+    }
+
+    public init(key: String, tool: String, displayName: String, duration: TimeInterval) {
+        self.key = key
+        self.tool = tool
+        self.displayName = displayName
+        self.duration = duration
+    }
+
+    /// Tolerant decode for version skew across the app↔daemon boundary.
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.tool = try c.decode(String.self, forKey: .tool)
+        self.key = try c.decodeIfPresent(String.self, forKey: .key) ?? tool
+        self.displayName = try c.decode(String.self, forKey: .displayName)
+        self.duration = try c.decode(TimeInterval.self, forKey: .duration)
+    }
+}
+
+/// "While you were away" summary, assembled by the daemon when the lid opens after a
+/// period that was closed with at least one active assertion.
+public struct AwaySummary: Codable, Sendable {
+    public let closedAt: Date
+    public let openedAt: Date
+    /// Agents that were active at lid-close and finished while closed.
+    public let finished: [FinishedAgentSummary]
+    /// Agents still holding an assertion at lid-open.
+    public let stillActive: [FinishedAgentSummary]
+    public let peakTemperatureCelsius: Double?
+    public let thermalCutout: Bool
+    /// Whether the low-battery cutout fired while the lid was closed.
+    public let lowBatteryCutout: Bool
+
+    public var awayDuration: TimeInterval {
+        openedAt.timeIntervalSince(closedAt)
+    }
+
+    public init(
+        closedAt: Date,
+        openedAt: Date,
+        finished: [FinishedAgentSummary],
+        stillActive: [FinishedAgentSummary],
+        peakTemperatureCelsius: Double?,
+        thermalCutout: Bool,
+        lowBatteryCutout: Bool = false,
+    ) {
+        self.closedAt = closedAt
+        self.openedAt = openedAt
+        self.finished = finished
+        self.stillActive = stillActive
+        self.peakTemperatureCelsius = peakTemperatureCelsius
+        self.thermalCutout = thermalCutout
+        self.lowBatteryCutout = lowBatteryCutout
+    }
+}
+
+public enum DaemonEvent: String, Codable, Sendable {
+    case acquired
+    case released
+    case thermalCutout
+    case lowBatteryCutout
+    case acPowerCutout
+    case idleRelease
+    case lidClosed
+    case lidOpened
+}
